@@ -1,0 +1,158 @@
+#! /usr/bin/env python3
+# -*- coding: utf-8 -*-
+# vi:ts=4:et
+
+import pycurl
+try:
+    from io import BytesIO
+except ImportError:
+    from StringIO import StringIO as BytesIO
+
+# We should ignore SIGPIPE when using pycurl.NOSIGNAL - see
+# the libcurl tutorial for more info.
+try:
+    import signal
+    from signal import SIGPIPE, SIG_IGN
+except ImportError:
+    pass
+else:
+    signal.signal(SIGPIPE, SIG_IGN)
+
+import os
+import time
+import logging
+import configparser
+
+def temp_raw(temp_sensor):
+
+    f = open(temp_sensor, 'r')
+    lines = f.readlines()
+    f.close()
+    return lines
+
+def read_temp(temp_sensor):
+
+    lines = temp_raw(temp_sensor)
+    while lines[0].strip()[-3:] != 'YES':
+        time.sleep(0.2)
+        lines = temp_raw()
+
+    temp_output = lines[1].find('t=')
+
+    if temp_output != -1:
+        temp_string = lines[1].strip()[temp_output+2:]
+        temp_c = float(temp_string) / 1000.0
+        return temp_c
+
+def updateServer(urls):
+    m = pycurl.CurlMulti()
+    age, version, version_num, host, features, ssl_version, ssl_version_num, libz_version, protocols, ares, ares_num, libidn   = pycurl.version_info()
+    userAgent = "curl/{0} ({1}) libcurl/{0} {2} zlib/{3}".format(version, host, ssl_version, libz_version)
+    curls = []
+    for data in urls:
+        logging.debug(data[0])
+        c = pycurl.Curl()
+        c.setopt(pycurl.USERAGENT, userAgent)
+        c.setopt(pycurl.FOLLOWLOCATION, 1)
+        c.setopt(pycurl.MAXREDIRS, 5)
+        c.setopt(pycurl.CONNECTTIMEOUT, data[2])
+        c.setopt(pycurl.TIMEOUT, data[3])
+        c.setopt(pycurl.NOSIGNAL, 1)
+        c.fp = BytesIO()
+        c.setopt(c.URL, data[0])
+        c.setopt(c.WRITEDATA, c.fp)
+        c.info = data[1]
+        m.add_handle(c)
+        curls.append(c)
+
+    num_handles = len(curls)
+    while num_handles:  
+        # Run the internal curl state machine for the multi stack
+        while 1:
+            ret, num_handles = m.perform()
+            if ret != pycurl.E_CALL_MULTI_PERFORM:
+                break
+        # Wait 1s...
+        ret = m.select(1)
+
+        # Check for curl objects which have terminated, and add them to the freelist
+        while 1:
+            num_q, ok_list, err_list = m.info_read()
+            for c in ok_list:
+                body = c.fp.getvalue()
+                data = body.decode('iso-8859-1')
+                if data.startswith("ok!"):
+                    logging.info("{}: {}".format(c.info, data))
+                else:
+                    logging.info("rejected {}".format(c.info))
+                m.remove_handle(c)
+                c.fp.close()
+                c.fp = None
+                c.close()
+            for c, errno, errmsg in err_list:
+                logging.warning("Failed '{}': {} {}".format(c.info, errno, errmsg))
+                m.remove_handle(c)
+                c.fp.close()
+                c.fp = None
+                c.close()
+            if num_q == 0:
+                break
+    m.close()
+
+import argparse
+
+parser = argparse.ArgumentParser(description='Fetch temperatures from W1 temperature sensors and send the data to temperatur.nu', add_help=True)
+parser.add_argument('-s', '--save_config', type=argparse.FileType('w', encoding='UTF-8'),
+        help='Store default configuration to <save_config>')
+parser.add_argument('-c', '--config', type=argparse.FileType('r', encoding='UTF-8'),
+        help='Configuration file <CONFIG>')
+parser.add_argument('-d', '--debug', action='store_false', help='set debug mode')
+
+args = parser.parse_args()
+
+if args.debug:
+    logging.basicConfig(format='%(asctime)s %(message)s', level=logging.INFO)
+else:
+    logging.basicConfig(format='%(asctime)s %(message)s', level=logging.DEBUG)
+
+if args.save_config != None:
+    config = configparser.ConfigParser()
+    config['DEFAULT'] = {"baseUrl": "http://www.temperatur.nu/rapportera.php", "CONNECTTIMEOUT": 30, "TIMEOUT": 300}
+    config['Sensor1'] = {"sensor": "28-0000073743b6", "hash": ""}
+    config['Sensor2'] = {"sensor": "28-00000737c95d", "hash": ""}
+    config.write(args.save_config)
+    quit()
+
+if args.config == None:
+    logging.warning("Mandatory argument --config not found.")
+    sys.exit(1)
+
+config = configparser.ConfigParser()
+config.read_file(args.config, args.config.name)
+
+logstr = None
+tempdata = []
+for section in config.sections():
+    if section.startswith('Sensor'):
+        sensor = config[section]
+        temp_sensor = "/sys/bus/w1/devices/" + sensor['sensor'] + "/w1_slave"
+        temp = read_temp(temp_sensor);
+        url = "{}?hash={}&t={}".format(sensor['baseurl'], sensor['hash'], temp)
+        if logstr == None:
+            logstr = ""
+        else:
+            logstr += " "
+        logstr += "{}: {}".format(section, temp)
+        tempdata.append([url, section, sensor.getint('connecttimeout'), sensor.getint('timeout')])
+    else:
+        logging.warning("unknown section: " + section) 
+logging.debug(logstr)
+
+if logstr == None:
+    logging.warning("No sensors found in configuration")
+    sys.exit(1)
+try:
+    updateServer(tempdata)
+except pycurl.error as e:
+    logging.warning("Server down: " + e[1])
+
